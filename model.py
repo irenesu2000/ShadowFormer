@@ -12,6 +12,8 @@ from torch import einsum
 import cv2
 import scipy.misc
 import utils
+from fightingcv_attention.attention.ECAAttention import *
+
 #########################################
 class ConvBlock(nn.Module):
     def __init__(self, in_channel, out_channel, strides=1):
@@ -243,13 +245,16 @@ class CAB(nn.Module):
         modules_body.append(conv(n_feat, n_feat, kernel_size, bias=bias))
         modules_body.append(act)
         modules_body.append(conv(n_feat, n_feat, kernel_size, bias=bias))
-
-        self.CA = CALayer(n_feat, reduction, bias=bias)
+        self.ECA = ECAAttention(kernel_size)
+        #self.CA = CALayer(n_feat, reduction, bias=bias)
         self.body = nn.Sequential(*modules_body)
 
     def forward(self, x):
         res = self.body(x)
-        res = self.CA(res)
+        #res = self.CA(res)
+        res = self.ECA(res)
+        #print('RES',res.shape)
+        #print('X',x.shape)
         res += x
         return res
 
@@ -487,6 +492,41 @@ class Mlp(nn.Module):
         flops += H*W*self.hidden_features*self.out_features
         print("MLP:{%.2f}"%(flops/1e9))
         return flops
+###################################################################
+#ECA module
+class eca_layer_1d(nn.Module):
+    """Constructs a ECA module.
+    Args:
+        channel: Number of channels of the input feature map
+        k_size: Adaptive selection of kernel size
+    """
+    def __init__(self, channel, k_size=3):
+        super(eca_layer_1d, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False) 
+        self.sigmoid = nn.Sigmoid()
+        self.channel = channel
+        self.k_size =k_size
+
+    def forward(self, x):
+        # b hw c
+        # feature descriptor on the global spatial information
+        y = self.avg_pool(x.transpose(-1, -2))
+
+        # Two different branches of ECA module
+        y = self.conv(y.transpose(-1, -2))
+
+        # Multi-scale information fusion
+        y = self.sigmoid(y)
+
+        return x * y.expand_as(x)
+
+    def flops(self): 
+        flops = 0
+        flops += self.channel*self.channel*self.k_size
+        
+        return flops
+###################################################################
 
 class LeFF(nn.Module):
     def __init__(self, dim=32, hidden_dim=128, act_layer=nn.GELU,drop = 0.):
@@ -498,6 +538,7 @@ class LeFF(nn.Module):
         self.linear2 = nn.Sequential(nn.Linear(hidden_dim, dim))
         self.dim = dim
         self.hidden_dim = hidden_dim
+        self.eca = eca_layer_1d(dim)
 
     def forward(self, x, img_size=(128,128)):
         # bs x hw x c
@@ -518,6 +559,7 @@ class LeFF(nn.Module):
         x = rearrange(x, ' b c h w -> b (h w) c', h = hh, w = ww)
 
         x = self.linear2(x)
+        x = self.eca(x)
 
         return x
 
@@ -529,6 +571,7 @@ class LeFF(nn.Module):
         flops += H*W*self.hidden_dim*3*3
         # fc2
         flops += H*W*self.hidden_dim*self.dim
+        flops += self.eca.flops()
         print("LeFF:{%.2f}"%(flops/1e9))
         return flops
 
@@ -682,6 +725,18 @@ class OutputProj(nn.Module):
 
 #########################################
 ########### CA Transformer #############
+# 初始化函數，定義 Transformer 模塊的各個屬性和超參數
+        # dim: 模型維度
+        # input_resolution: 輸入的圖像分辨率
+        # num_heads: 注意力頭的數量
+        # win_size, shift_size: 如果應用局部注意力，定義窗口大小和移動大小
+        # mlp_ratio: MLP 中隱藏層維度相對於模型維度的比例
+        # qkv_bias, qk_scale: 注意力機制相關的超參數
+        # drop, attn_drop, drop_path: 用於正則化的 dropout 和 drop path
+        # act_layer: 激活函數的類型，預設為 GELU
+        # norm_layer: 正規化層的類型，預設為 LayerNorm
+        # token_projection, token_mlp: 用於投影和多層感知機的類型，預設為 linear 和 leff
+        # se_layer: 是否使用 Squeeze-and-Excitation 注意力機制
 class CATransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, win_size=10, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
