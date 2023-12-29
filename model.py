@@ -12,7 +12,7 @@ from torch import einsum
 import cv2
 import scipy.misc
 import utils
-from fightingcv_attention.attention.ECAAttention import *
+from fightingcv_attention.attention.ShuffleAttention import *
 
 #########################################
 class ConvBlock(nn.Module):
@@ -239,20 +239,22 @@ def conv(in_channels, out_channels, kernel_size, bias=False, stride = 1):
 ##########################################################################
 ## Channel Attention Block (CAB)
 class CAB(nn.Module):
-    def __init__(self, n_feat, kernel_size, reduction, bias, act):
+    def __init__(self, n_feat, kernel_size, reduction, bias, act, G=8):
         super(CAB, self).__init__()
         modules_body = []
         modules_body.append(conv(n_feat, n_feat, kernel_size, bias=bias))
         modules_body.append(act)
         modules_body.append(conv(n_feat, n_feat, kernel_size, bias=bias))
-        self.ECA = ECAAttention(kernel_size)
+        self.SA = ShuffleAttention(channel=n_feat, G=G)
+        #self.ECA = ECAAttention(kernel_size)
         #self.CA = CALayer(n_feat, reduction, bias=bias)
         self.body = nn.Sequential(*modules_body)
 
     def forward(self, x):
         res = self.body(x)
+        res = self.SA(res)
         #res = self.CA(res)
-        res = self.ECA(res)
+        #res = self.ECA(res)
         #print('RES',res.shape)
         #print('X',x.shape)
         res += x
@@ -761,7 +763,7 @@ class CATransformerBlock(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer,
                        drop=drop) if token_mlp == 'ffn' else LeFF(dim, mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        self.CAB = CAB(dim, kernel_size=3, reduction=4, bias=False, act=nn.PReLU())
+        self.CAB = CAB(dim, kernel_size=3, reduction=4, bias=False, act=nn.PReLU(), G=8)
 
 
     def extra_repr(self) -> str:
@@ -837,7 +839,7 @@ class SIMTransformerBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim,act_layer=act_layer, drop=drop) if token_mlp=='ffn' else LeFF(dim,mlp_hidden_dim,act_layer=act_layer, drop=drop)
-        self.CAB = CAB(dim, kernel_size=3, reduction=4, bias=False, act=nn.PReLU())
+        self.CAB = CAB(dim, kernel_size=3, reduction=4, bias=False, act=nn.PReLU(), G=8)
 
 
     def extra_repr(self) -> str:
