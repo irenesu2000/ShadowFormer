@@ -10,9 +10,9 @@ class Options():
 
     def init(self, parser):
         # global settings
-        parser.add_argument('--batch_size', type=int, default=7, help='batch size')
+        parser.add_argument('--batch_size', type=int, default=2, help='batch size')
         parser.add_argument('--nepoch', type=int, default=500, help='training epochs')
-        parser.add_argument('--train_workers', type=int, default=0, help='train_dataloader workers')
+        parser.add_argument('--train_workers', type=int, default=4, help='train_dataloader workers')
         parser.add_argument('--eval_workers', type=int, default=8, help='eval_dataloader workers')
         parser.add_argument('--dataset', type=str, default='ISTD')
         parser.add_argument('--pretrain_weights', type=str, default='./log/model_best.pth',
@@ -20,7 +20,7 @@ class Options():
         parser.add_argument('--optimizer', type=str, default='adamw', help='optimizer for training')
         parser.add_argument('--lr_initial', type=float, default=0.0002, help='initial learning rate')
         parser.add_argument('--weight_decay', type=float, default=0.02, help='weight decay')
-        parser.add_argument('--gpu', type=str, default='2', help='GPUs')
+        parser.add_argument('--gpu', type=str, default='0', help='GPUs')
         parser.add_argument('--arch', type=str, default='ShadowFormer', help='archtechture')
         parser.add_argument('--mode', type=str, default='shadow', help='image restoration mode')
 
@@ -51,8 +51,8 @@ class Options():
         # args for training
         parser.add_argument('--train_ps', type=int, default=320, help='patch size of training sample')
         parser.add_argument('--resume', action='store_true', default=False)
-        parser.add_argument('--train_dir', type=str, default='../ISTD_Dataset/train', help='dir of train data')
-        parser.add_argument('--val_dir', type=str, default='../ISTD_Dataset/test', help='dir of train data')
+        parser.add_argument('--train_dir', type=str, default='./ISTD_Dataset/train', help='dir of train data')
+        parser.add_argument('--val_dir', type=str, default='./ISTD_Dataset/test', help='dir of train data')
         parser.add_argument('--warmup', action='store_true', default=True, help='warmup')
         parser.add_argument('--warmup_epochs', type=int, default=3, help='epochs for warmup')
 
