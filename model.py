@@ -495,6 +495,115 @@ class Mlp(nn.Module):
         print("MLP:{%.2f}"%(flops/1e9))
         return flops
 ###################################################################
+#AgentAttention
+class AgentAttention(nn.Module):
+    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
+    It supports both of shifted and non-shifted window.
+
+    Args:
+        dim (int): Number of input channels.
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
+        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
+        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
+    """
+
+    def __init__(self, dim, win_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.,
+                 shift_size=0, agent_num=49, **kwargs):
+
+        super().__init__()
+        self.dim = dim
+        self.win_size = win_size  # Wh, Ww
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.softmax = nn.Softmax(dim=-1)
+        self.shift_size = shift_size
+
+        self.agent_num = agent_num
+        self.dwc = nn.Conv2d(in_channels=dim, out_channels=dim, kernel_size=(3, 3), padding=1, groups=dim)
+        self.an_bias = nn.Parameter(torch.zeros(num_heads, agent_num, 7, 7))
+        self.na_bias = nn.Parameter(torch.zeros(num_heads, agent_num, 7, 7))
+        self.ah_bias = nn.Parameter(torch.zeros(1, num_heads, agent_num, win_size[0], 1))
+        self.aw_bias = nn.Parameter(torch.zeros(1, num_heads, agent_num, 1, win_size[1]))
+        self.ha_bias = nn.Parameter(torch.zeros(1, num_heads, win_size[0], 1, agent_num))
+        self.wa_bias = nn.Parameter(torch.zeros(1, num_heads, 1, win_size[1], agent_num))
+        trunc_normal_(self.an_bias, std=.02)
+        trunc_normal_(self.na_bias, std=.02)
+        trunc_normal_(self.ah_bias, std=.02)
+        trunc_normal_(self.aw_bias, std=.02)
+        trunc_normal_(self.ha_bias, std=.02)
+        trunc_normal_(self.wa_bias, std=.02)
+        pool_size = int(agent_num ** 0.5)
+        self.pool = nn.AdaptiveAvgPool2d(output_size=(pool_size, pool_size))
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        b, n, c = x.shape
+        h = int(n ** 0.5)
+        w = int(n ** 0.5)
+        num_heads = self.num_heads
+        head_dim = c // num_heads
+        qkv = self.qkv(x).reshape(b, n, 3, c).permute(2, 0, 1, 3)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+        # q, k, v: b, n, c
+
+        agent_tokens = self.pool(q.reshape(b, h, w, c).permute(0, 3, 1, 2)).reshape(b, c, -1).permute(0, 2, 1)
+        q = q.reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
+        k = k.reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
+        v = v.reshape(b, n, num_heads, head_dim).permute(0, 2, 1, 3)
+        agent_tokens = agent_tokens.reshape(b, self.agent_num, num_heads, head_dim).permute(0, 2, 1, 3)
+
+        position_bias1 = nn.functional.interpolate(self.an_bias, size=self.win_size, mode='bilinear')
+        position_bias1 = position_bias1.reshape(1, num_heads, self.agent_num, -1).repeat(b, 1, 1, 1)
+        position_bias2 = (self.ah_bias + self.aw_bias).reshape(1, num_heads, self.agent_num, -1).repeat(b, 1, 1, 1)
+        position_bias = position_bias1 + position_bias2
+        agent_attn = self.softmax((agent_tokens * self.scale) @ k.transpose(-2, -1) + position_bias)
+        agent_attn = self.attn_drop(agent_attn)
+        agent_v = agent_attn @ v
+
+        agent_bias1 = nn.functional.interpolate(self.na_bias, size=self.win_size, mode='bilinear')
+        agent_bias1 = agent_bias1.reshape(1, num_heads, self.agent_num, -1).permute(0, 1, 3, 2).repeat(b, 1, 1, 1)
+        agent_bias2 = (self.ha_bias + self.wa_bias).reshape(1, num_heads, -1, self.agent_num).repeat(b, 1, 1, 1)
+        agent_bias = agent_bias1 + agent_bias2
+        q_attn = self.softmax((q * self.scale) @ agent_tokens.transpose(-2, -1) + agent_bias)
+        q_attn = self.attn_drop(q_attn)
+        x = q_attn @ agent_v
+
+        x = x.transpose(1, 2).reshape(b, n, c)
+        v = v.transpose(1, 2).reshape(b, h, w, c).permute(0, 3, 1, 2)
+        x = x + self.dwc(v).permute(0, 2, 3, 1).reshape(b, n, c)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, win_size={self.win_size}, num_heads={self.num_heads}'
+
+    def flops(self, N):
+        # calculate flops for 1 window with token length of N
+        flops = 0
+        # qkv = self.qkv(x)
+        flops += N * self.dim * 3 * self.dim
+        # attn = (q @ k.transpose(-2, -1))
+        flops += self.num_heads * N * (self.dim // self.num_heads) * N
+        #  x = (attn @ v)
+        flops += self.num_heads * N * N * (self.dim // self.num_heads)
+        # x = self.proj(x)
+        flops += N * self.dim * self.dim
+        return flops
+
+###################################################################
 #ECA module
 class eca_layer_1d(nn.Module):
     """Constructs a ECA module.
@@ -815,7 +924,7 @@ class CATransformerBlock(nn.Module):
 class SIMTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, win_size=10, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,token_projection='linear',token_mlp='leff',se_layer=False):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm,token_projection='linear',token_mlp='leff',se_layer=False,agent_num=49, attn_type='A'):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -830,10 +939,17 @@ class SIMTransformerBlock(nn.Module):
         assert 0 <= self.shift_size < self.win_size, "shift_size must in 0-win_size"
 
         self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim, win_size=to_2tuple(self.win_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
-            token_projection=token_projection,se_layer=se_layer)
+        ####
+        assert attn_type in ['A', 'B']
+        if attn_type == 'A':
+            self.attn = AgentAttention(dim=dim, win_size=to_2tuple(self.win_size), num_heads=num_heads,
+                                       qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
+                                       agent_num=agent_num)
+        else:
+            self.attn = WindowAttention(
+                dim, win_size=to_2tuple(self.win_size), num_heads=num_heads,
+                qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
+                token_projection=token_projection,se_layer=se_layer)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -890,11 +1006,11 @@ class SIMTransformerBlock(nn.Module):
 
 
         x = x.view(B, H, W, C)
-        xm = xm.permute(0, 2, 3, 1)
+        #xm = xm.permute(0, 2, 3, 1)
         # cyclic shift
         if self.shift_size > 0:
             shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
-            shifted_m = torch.roll(xm, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            #shifted_m = torch.roll(xm, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
             shifted_x = x
             shifted_m = xm
@@ -902,16 +1018,14 @@ class SIMTransformerBlock(nn.Module):
         # partition windows
         x_windows = window_partition(shifted_x, self.win_size)  # nW*B, win_size, win_size, C  N*C->C
         x_windows = x_windows.view(-1, self.win_size * self.win_size, C)  # nW*B, win_size*win_size, C
-        m_windows = window_partition(shifted_m, self.win_size)  # nW*B, win_size, win_size, C  N*C->C
-        m_windows = m_windows.view(-1, self.win_size * self.win_size, 1)  # nW*B, win_size*win_size, C
+        #m_windows = window_partition(shifted_m, self.win_size)  # nW*B, win_size, win_size, C  N*C->C
+        #m_windows = m_windows.view(-1, self.win_size * self.win_size, 1)  # nW*B, win_size*win_size, C
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, m_windows, mask=attn_mask)  # nW*B, win_size*win_size, C
+        attn_windows = self.attn(x_windows, mask=attn_mask)  # nW*B, win_size*win_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.win_size, self.win_size, C)
-
-
         shifted_x = window_reverse(attn_windows, self.win_size, H, W)  # B H' W' C
 
         # reverse cyclic shift
@@ -957,7 +1071,7 @@ class BasicShadowFormer(nn.Module):
     def __init__(self, dim, output_dim, input_resolution, depth, num_heads, win_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, use_checkpoint=False,
-                 token_projection='linear',token_mlp='ffn',se_layer=False,cab=False):
+                 token_projection='linear',token_mlp='ffn',se_layer=False,cab=False,agent_num=49, attn_type='A'):
 
         super().__init__()
         self.dim = dim
@@ -986,7 +1100,7 @@ class BasicShadowFormer(nn.Module):
                                      qkv_bias=qkv_bias, qk_scale=qk_scale,
                                      drop=drop, attn_drop=attn_drop,
                                      drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                     norm_layer=norm_layer,token_projection=token_projection,token_mlp=token_mlp,se_layer=se_layer)
+                                     norm_layer=norm_layer,token_projection=token_projection,token_mlp=token_mlp,se_layer=se_layer,agent_num=agent_num, attn_type=attn_type)
                 for i in range(depth)])
 
     def extra_repr(self) -> str:
